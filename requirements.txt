@@ -1,0 +1,8 @@
+streamlit>=1.33.0
+transformers>=4.40.0
+evaluate>=0.4.1
+torch
+sentencepiece
+sacrebleu
+bert_score
+comet-ml
