@@ -1,99 +1,106 @@
-# app.py – Streamlit app for translating any language to Turkish and evaluating with BLEU, BERTScore, COMET
-# ------------------------------------------------------------------------------
-# Requirements (add these lines in a requirements.txt file in the same repo):
-# streamlit>=1.33.0
-# transformers>=4.40.0
-# evaluate>=0.4.1
-# torch  # or accelerate if using CPU-only runtime
-# sentencepiece  # tokenizer dependency
-# sacrebleu
-# bert_score
-# comet-ml  # for COMET metric model download (GPU recommended)
-# ------------------------------------------------------------------------------
-# On Streamlit Community Cloud, set an environment variable HF_HOME="/tmp/huggingface" 
-# to ensure model weights are cached in ephemeral storage.
-
-import streamlit as st
+from __future__ import annotations
+import os, functools
+import gradio as gr
 from transformers import pipeline
 import evaluate
+from langdetect import detect
 
-# ---------------------------------------------------------------
-# Cached model & metric loaders – run only once per session
-# ---------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
+# Writable cache dirs inside the HF sandbox
+os.environ["HOME"] = "/tmp"
+os.environ["HF_HOME"] = "/tmp/.cache/hf"
+os.makedirs("/tmp/.cache/hf", exist_ok=True)
+
+MODEL_ID   = "facebook/nllb-200-distilled-600M"   # use 418M for lighter demo
+TARGET_TAG = "tur_Latn"
+
+NLLB_MAP = {
+    "af": "afr_Latn", "ar": "arb_Arab", "de": "deu_Latn", "en": "eng_Latn",
+    "es": "spa_Latn", "fr": "fra_Latn", "hi": "hin_Deva", "ja": "jpn_Jpan",
+    "ko": "kor_Hang", "pt": "por_Latn", "ru": "rus_Cyrl", "tr": "tur_Latn",
+    "zh-cn": "zho_Hans",
+}
+
+@functools.lru_cache(maxsize=1)
 def load_components():
-    """Download/instantiate translator + evaluation metrics once."""
-    # Multilingual → Turkish MarianMT model (compact 85 MB)
-    translator = pipeline(
-        "translation",
-        model="Helsinki-NLP/opus-mt-mul-tr",
-        tokenizer="Helsinki-NLP/opus-mt-mul-tr",
-        max_length=512
-    )
-
-    bleu = evaluate.load("sacrebleu")  # faster & accurate BLEU
-    bertscore = evaluate.load("bertscore")
-    comet = evaluate.load("comet")  # downloads ~500 MB model the first time
-
+    translator = pipeline("translation", model=MODEL_ID, tokenizer=MODEL_ID, max_length=512)
+    bleu       = evaluate.load("sacrebleu")
+    bertscore  = evaluate.load("bertscore")
+    try:
+        comet = evaluate.load("comet")
+    except Exception:
+        comet = None
     return translator, bleu, bertscore, comet
 
 translator, bleu_metric, bert_metric, comet_metric = load_components()
 
-# ---------------------------------------------------------------
-# Streamlit page config & custom CSS for a sleek, minimal look
-# ---------------------------------------------------------------
-st.set_page_config(
-    page_title="Türkçe Çeviri + Değerlendirme",
-    page_icon="🇹🇷",
-    layout="centered"
-)
+def translate_and_score(source: str, reference: str | None):
+    if not source.strip():
+        return "", "–", "–", "–"
 
-st.markdown(
-    """
-    <style>
-        html, body {font-family: 'Inter', sans-serif; background:#ffffff; color:#111827;}
-        .stTextArea textarea {font-size:0.9rem; line-height:1.4;}
-        div.stButton > button:first-child {
-            background-color:#1f2937; color:white; border:none; border-radius:8px;
-            padding:0.6em 1.2em; font-weight:600; transition: background 0.3s ease;
-        }
-        div.stButton > button:first-child:hover {background:#374151;}
-        div[data-testid="stMetric"] {background:#f9fafb; border-radius:8px; padding:1em; box-shadow:0 1px 3px rgba(0,0,0,0.06);} 
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+    try:
+        lang_iso = detect(source[:200])
+    except Exception:
+        lang_iso = "en"
+    src_tag = NLLB_MAP.get(lang_iso, "eng_Latn")
 
-# ---------------------------------------------------------------
-# App UI
-# ---------------------------------------------------------------
-st.title("Translate to Turkish & Auto‑Evaluate")
+    translation = translator(source.strip(), src_lang=src_tag, tgt_lang=TARGET_TAG)[0]["translation_text"]
 
-st.write("Paste any sentence below, click **Translate**, and (optionally) supply a reference Turkish translation to get BLEU, BERTScore, and COMET quality scores.")
-
-source_text = st.text_area("🌐 Source text (any language)", height=140, placeholder="Type or paste here…")
-reference_text = st.text_area("🎯 Reference translation in Turkish (optional)", height=140, placeholder="If you have a gold translation, paste it here for scoring…")
-
-if st.button("Translate"):
-    if not source_text.strip():
-        st.warning("Please enter some text to translate.")
+    if reference and reference.strip():
+        bleu  = bleu_metric.compute(predictions=[translation], references=[[reference.strip()]])["score"]
+        bert  = bert_metric.compute(
+            predictions=[translation],
+            references=[reference.strip()],
+            lang="tr",
+            model_type="dbmdz/bert-base-turkish-cased",
+        )["f1"][0] * 100
+        comet = "N/A"
+        if comet_metric is not None:
+            try:
+                comet = comet_metric.compute(
+                    predictions=[translation],
+                    references=[reference.strip()],
+                    sources=[source.strip()],
+                )["scores"][0]
+            except Exception:
+                comet = "N/A"
+        return translation, f"{bleu:.2f}", f"{bert:.2f}", f"{comet}" if isinstance(comet, str) else f"{comet:.2f}"
     else:
-        with st.spinner("Translating…"):
-            translation = translator(source_text.strip())[0]["translation_text"]
-        st.text_area("🚀 Model translation", value=translation, height=140)
+        return translation, "–", "–", "–"
 
-        # Evaluation block only if reference is given
-        if reference_text.strip():
-            with st.spinner("Calculating scores…"):
-                bleu_score = bleu_metric.compute(predictions=[translation], references=[[reference_text.strip()]])
-                bert_score = bert_metric.compute(predictions=[translation], references=[reference_text.strip()], lang="tr")
-                comet_score = comet_metric.compute(predictions=[translation], references=[reference_text.strip()], sources=[source_text.strip()])
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown(
+        "# Evaluator  \n"
+        "Enter text in **any language**, get a Turkish translation plus automatic "
+        "**BLEU**, **BERTScore (BERTurk)** and **COMET** scores."
+    )
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric("BLEU", f"{bleu_score['score']:.2f}")
-            col2.metric("BERTScore F1", f"{bert_score['f1'][0]*100:.2f}")
-            col3.metric("COMET", f"{comet_score['scores'][0]:.2f}")
-        else:
-            st.info("Add a reference translation to compute quality metrics.")
+    with gr.Row():
+        src_box = gr.Textbox(label="Source Text", lines=6, placeholder="Paste or type any text…")
+        ref_box = gr.Textbox(
+            label="Reference Turkish Translation (optional)",
+            lines=6,
+            placeholder="If you have a gold translation, paste it here…",
+        )
 
-st.markdown("— Made with ❤️ using Streamlit, Hugging Face Transformers & Evaluate —")
+    translate_btn = gr.Button("Translate & Evaluate", variant="primary")
+
+    out_translation = gr.Textbox(label="Model Translation", lines=6)
+    with gr.Row():
+        bleu_out  = gr.Textbox(label="BLEU", max_lines=1)
+        bert_out  = gr.Textbox(label="BERTScore F1", max_lines=1)
+        comet_out = gr.Textbox(label="COMET", max_lines=1)
+
+    translate_btn.click(
+        translate_and_score,
+        inputs=[src_box, ref_box],
+        outputs=[out_translation, bleu_out, bert_out, comet_out],
+    )
+
+    gr.Markdown(
+        "<small>Translation model: <b>facebook/nllb‑200‑distilled‑600M</b>  ·  "
+        "BERTScore embeddings: <b>BERTurk</b></small>",
+        unsafe_allow_html=True,
+    )
+
+if __name__ == "__main__":
+    demo.launch()
